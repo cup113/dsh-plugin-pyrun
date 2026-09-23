@@ -26,10 +26,15 @@
   "engines": {
     "node": ">=22"
   },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+  "scripts": {
+    "test": "node --test test/"
   },
-  "dependencies": {
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-sandbox": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+  },
+  "devDependencies": {
     "@deepseek-ai/dsh-sandbox": "0.1.5-rc.2",
     "@deepseek-ai/dsh-tools": "0.1.5-rc.2"
   },

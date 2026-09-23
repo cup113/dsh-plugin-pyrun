@@ -13,12 +13,31 @@ DeepSeek Harness 的 Python 快捷执行工具插件：模型直接给 Python �
 ## 安装
 
 ```powershell
-dsh plugin --profile web add D:/Projects/dsh-plugin-pyrun
+dsh plugin --profile web add link:D:/Projects/dsh-plugin-pyrun
 ```
+
+显式写 `link:`：`link:` 安装只在 profile 里建一个软链，**不往 profile 装任何依赖**（本机 profile 里 `personal-track` 就是 `link:`，它的 `zod` / `schemastery` 都不在 profile 根）。这样 profile 里绝不会多出核心包副本，改完本仓库代码重启即生效。
 
 `dsh plugin add` 写 `~/.dsh` 并运行 pnpm，在受限沙箱下需要一次性提权。安装成功后该包作为一层 bundle 进入 profile（因为它声明了 `dsh.bundle.patch`）。
 
 **装完必须重启 `dsh`。** 宿主半身是 Node ESM 模块，只有重启才会重新加载；profile 的 `patchReload: live` 只重读 patch，不重载已缓存的模块。
+
+### 核心包契约：消费方 profile 里只允许存在一份
+
+`@deepseek-ai/dsh-tools` 与 `@deepseek-ai/dsh-sandbox` 的声明分两处，各司其职：
+
+| 位置 | 作用 |
+|---|---|
+| `peerDependencies` | 运行契约：真正跑这份代码的实例由 harness 提供（非 `link:` 安装时走 `~/.dsh/profiles/node_modules` 回退层，其中 `@deepseek-ai/*` 全部软链到 `...\node_modules\@deepseek-ai\dsh` 的宿主安装树），与宿主 agent loop 共享**同一份物理副本** |
+| `devDependencies`（精确锁定 `0.1.5-rc.2`） | 只为本仓库服务：本插件以 `link:` 安装，Node 按 realpath 从 `D:\Projects\dsh-plugin-pyrun` 解析用它自己的 `import`，而回退层不是它的祖先目录（缺这份副本会直接 `ERR_MODULE_NOT_FOUND` 加载失败）。**消费方 profile 永不安装依赖的 devDependencies**，所以它不会落到 profile 里 |
+
+**绝不要把这两个包写进 `dependencies`。** 除 `link:` 之外的安装方式（`file:` / 打包 / registry / git）都会让 profile 安装插件的普通依赖——本机 profile 用 `nodeLinker: hoisted`，会直接把它们物化到 profile 根 `node_modules`——于是进程里出现第二份 `dsh-tools`。它用模块局部 `Symbol('@deepseek-ai/dsh-tools.scheduler')` 当工具调度器的键，两份副本的 Symbol 不相等 → `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined` → **该进程内所有工具调用**都崩在 agent-loop 的 `tool-calls` 上：
+
+```
+Cannot read properties of undefined (reading 'prepare')
+```
+
+`defineTool` 与沙箱辅助函数都不携带跨包的 Symbol 状态，因此插件本地那份 devDependencies 副本是惰性的、不会参与宿主的调度器查表；只有被**消费方**安装并提升进 profile 的那一份才造成分裂。`link:` 安装更是连普通依赖都不装（本机 profile 里 `personal-track` 的 `zod` / `schemastery` 都不在 profile 根，可作对照）。`pnpm test` 的清单断言守着「必须在 peer、可在 dev、绝不可在 dependencies」这条规则。
 
 ## 用法
 
@@ -117,7 +136,9 @@ Error: Cannot read properties of undefined (reading 'Symbol(dsh.scope)')
 ## 开发
 
 - **无构建步骤**：纯 ESM JavaScript（`src/index.js`），没有 `prepare` 脚本，因此不会触发 pnpm 的构建拦截（`allowBuilds`）。
-- **运行时依赖必须显式声明**：`@deepseek-ai/dsh-tools`（`defineTool`）与 `@deepseek-ai/dsh-sandbox`（`approveEscalation` 与标记文案）。它们被真实 `import`，会随 profile 安装进 `~/.dsh/profiles/web/node_modules`。
+- **核心包必须声明为 `peerDependencies`**：`@deepseek-ai/dsh-tools`（`defineTool`）与 `@deepseek-ai/dsh-sandbox`（`approveEscalation` 与标记文案）被真实 `import`。写进 `dependencies` 会让**消费方 profile** 把它们安装并提升进 profile 根 `node_modules`，造成第二份物理副本、Symbol 分裂、全进程工具调用崩溃（见上「核心包契约」）；同时它们必须精确锁定在 `devDependencies` 里，否则 `link:` 安装的插件解析不到自己的 `import`。`test/manifest.test.mjs` 是这条规则的常驻断言。
+- **lockfile 里的 `dependencies: @deepseek-ai/cordis` 不是本插件的声明**：`package.json` 把 cordis 放在 `peerDependencies`，是 pnpm 的 `autoInstallPeers` 把它自动装进本仓库树的产物，只为本地可加载。消费方 profile 一律按 `package.json` 的 peer 处理。
+- **测试**：`pnpm test`（`node --test test/`）。在本 DSH 沙箱内 `node --test test/` 会因 piped-stdio spawn 被沙箱拒绝（`spawn EPERM`，沙箱边界而非测试失败），此时改用 `node test/manifest.test.mjs` 或 `node --test --test-isolation=none "test/*.test.mjs"`。
 - **不依赖 `@deepseek-ai/dsh-llm`**：`HarnessError` 只在 `errorInfo()` 的 `instanceof` 判定里被识别，而进程内插件拿到的是另一份独立拷贝，`instanceof` 必为假——与其静默退化，不如根本不走那条路（取消由运行时的规范通道处理）。
 - **改宿主半身 → 重启 `dsh`**；改 `cordis.patch.yml` 可由 `patchReload: live` 生效。
 - 重装/更新：重复执行上面的 `dsh plugin --profile web add ...`。
@@ -128,3 +149,24 @@ Error: Cannot read properties of undefined (reading 'Symbol(dsh.scope)')
 - **没有 Config**：超时、输出上限一律用执行器的默认值与上限。
 - **与同名工具冲突**：本插件在 web profile 里注册 `python`。重启后不要再激活动态插件 `pyrun-1`（它注册同名工具，且进程内已不存在）。
 - **依赖 PATH 中的 `python`**：插件不探测解释器路径。
+
+## 故障诊断：所有工具调用失败
+
+症状：该进程内**任何**工具调用都失败（不只是 `python`），报 `Cannot read properties of undefined (reading 'prepare')`，栈落在 `dsh-agent-loop` 的 `tool-calls`。重启 `dsh`、删插件、重装都无效。
+
+排查（期望值都写在注释里）：
+
+```powershell
+# 1. 插件是否把核心包物化进了 profile？期望：False（这一份就是元凶）
+Test-Path "$env:USERPROFILE\.dsh\profiles\web\node_modules\@deepseek-ai\dsh-tools"
+# 2. 本仓库那份只应是 devDependency 的惰性副本，且版本与宿主一致
+pnpm why @deepseek-ai/dsh-tools
+# 3. 全机副本清点：profile 侧不应出现，宿主安装树下有且只有一份
+Get-ChildItem "$env:USERPROFILE\.dsh" -Recurse -Directory -Filter 'dsh-tools' -ErrorAction SilentlyContinue
+```
+
+处置：确认清单里它不在 `dependencies`（在就改回 `devDependencies` 并 `pnpm install`）；profile 侧 `dsh plugin --profile web remove dsh-plugin-pyrun` 再重新 `add`（让 pnpm 重算 profile 的 node_modules）；**完全重启 `dsh`**（`patchReload: live` 不重载已缓存的模块）。
+
+⚠️ **崩溃轮次会毒化会话**：那一轮留下了没有对应 `tool/result` 的孤儿 `tool_calls`，此后该会话每轮都报 `INVALID_REQUEST: ... tool calls need immediate results`；插件修好也救不回来，只能弃用并新建会话。
+
+⚠️ **上游同一缺陷未修**：`0.1.5-rc.2` 的 `dsh-tools` 里两处 `TOOL_RUNTIME_SCHEDULER` 都是模块局部 `Symbol(...)`（`lib/index.js:51` 与 `2430`，另有 `lib/types/index.js:51`），没有 `Symbol.for` 兜底。升级 harness 换不掉"插件自带副本"这条路径，本插件只能保证自己不再制造副本。
