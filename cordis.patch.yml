@@ -1,0 +1,5 @@
+# Loader rows this package contributes when installed as a bundle:
+#   dsh plugin --profile web add D:/Projects/dsh-plugin-pyrun
+- insert:
+    - id: dsh-plugin-pyrun
+      name: dsh-plugin-pyrun
