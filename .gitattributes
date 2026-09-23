@@ -1,0 +1,4 @@
+# Every text file in this repository is LF in the working tree. The package is
+# a Node ESM bundle loaded by dsh and inspected on Windows, where a CRLF
+# checkout would otherwise add noise to every diff.
+* text=auto eol=lf

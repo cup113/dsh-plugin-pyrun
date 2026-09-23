@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cup113/dsh-plugin-pyrun.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cup113/dsh-plugin-pyrun/issues"
+  },
   "type": "module",
   "description": "DSH Python quick-exec tool: source piped to `python -X utf8 -u -` over stdin, with sandbox escalation and background jobs.",
   "main": "src/index.js",
@@ -13,7 +20,8 @@
   "files": [
     "src",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=22"
