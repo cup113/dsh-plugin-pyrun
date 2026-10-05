@@ -7,9 +7,9 @@
  * register with the generic `ctx.jobs` runtime and are collected with the
  * `job_output` / `job_kill` tools.
  *
- * Migrated from the dynamic Cordis plugin `pyrun-1`/`pkg-5`, so this file
- * targets the @deepseek-ai/dsh 0.1.5-rc.2 runtime contract (see README for the
- * 0.1.6+ migration table).
+ * Ported to the @deepseek-ai/dsh 0.2.x runtime contract (contract basis:
+ * deepseek-harness @ 5badb15009 = 0.2.1-alpha.1; the 0.1.5-rc.2 world this
+ * plugin grew up in is described historically in the README).
  *
  * @module dsh-plugin-pyrun
  */
@@ -48,30 +48,88 @@ function jobLabel(code) {
   return first.length > 72 ? `${first.slice(0, 72)}…` : first
 }
 
-/** Map a settled background process onto the generic job-outcome vocabulary. */
-function processOutcome(proc) {
-  if (proc.status === 'killed') {
-    return { status: 'killed', detail: proc.signal !== null ? `signal: ${proc.signal}` : 'killed before exit' }
+/** Sandbox facts worth the terminal detail: a runner that never ran the program, or a denial with this composition's escalation hint. */
+function sandboxNotes(sandbox, escalationModes) {
+  if (sandbox?.runnerFailed) {
+    return [`[sandbox: the sandbox runner itself failed under ${sandbox.mode} mode — the command did not run; this is a sandbox problem, not a command failure]`]
   }
-  return { status: 'completed', detail: `exit code: ${proc.exitCode ?? 0}` }
+  if (sandbox?.denied) {
+    const notes = [sandboxDenialMarker(sandbox.mode)]
+    if (escalationModes.length > 0) notes.push(escalationHintMarker('program'))
+    return notes
+  }
+  return []
 }
 
-/** Shape one background-process read into the `job_output` delta, with loss and sandbox notices appended. */
-function renderProcessRead(read, sandbox) {
-  const notices = []
-  if (read.lossy) {
-    const paths = [read.stdoutSpillPath, read.stderrSpillPath].filter(path => path !== undefined)
-    notices.push(`[some output was dropped from memory; full output: ${paths.length > 0 ? paths.join(', ') : '(unavailable)'}]`)
+/**
+ * Map a settled background process onto the generic job-outcome vocabulary:
+ * `killed` stays `killed` (the signal when one is known), everything else is
+ * `completed` with the exit code as detail — a nonzero Python exit is
+ * reported, not failed, exactly like the foreground rendering. Sandbox facts
+ * join the detail, since a job's terminal reason is the one line every
+ * reader — the model's status line, the roster row — shows.
+ */
+function processOutcome(proc, escalationModes) {
+  const base = proc.status === 'killed'
+    ? { status: 'killed', detail: proc.signal !== null ? `signal: ${proc.signal}` : 'killed before exit' }
+    : { status: 'completed', detail: `exit code: ${proc.exitCode ?? 0}` }
+  const notes = sandboxNotes(proc.sandbox, escalationModes)
+  return notes.length === 0 ? base : { ...base, detail: `${base.detail}; ${notes.join(' ')}` }
+}
+
+/**
+ * The process's non-consuming stream readers (`ShellExecution.observed`) as
+ * registry pull sources: the registry pumps them into the job's output ring
+ * at its own cadence, and `job_output` renders the deltas with the same
+ * `[stderr]` section and dropped-output notices a foreground result shows.
+ * They bind lazily because the process spawns inside the starter, after the
+ * registry admitted the job; a read before the spawn yields nothing.
+ */
+function pythonSources(getProc) {
+  const source = channel => ({
+    channel,
+    read: (fromByte) => {
+      const live = getProc()
+      return live === undefined ? { text: '', nextOffset: fromByte, lossy: false } : live.observed[channel].readFrom(fromByte)
+    },
+  })
+  return [source('stdout'), source('stderr')]
+}
+
+/**
+ * Adapt asynchronous shell preparation after job admission without exposing
+ * a partial process: `start` receives the job-owned cancellation signal, the
+ * process is killed when cancellation wins the race against the spawn, and
+ * `done` settles the outcome — or `killed` when cancelled before the spawn,
+ * or `failed` with the preparation error as detail.
+ */
+function pythonJob(start, outcome) {
+  const controller = new AbortController()
+  let proc
+  const done = (async () => {
+    try {
+      proc = await start(controller.signal)
+      try {
+        if (controller.signal.aborted) proc.kill()
+      } finally {
+        await proc.done
+      }
+      return outcome(proc)
+    } catch (error) {
+      return {
+        status: controller.signal.aborted && proc === undefined ? 'killed' : 'failed',
+        detail: error instanceof Error ? error.message : String(error),
+      }
+    }
+  })()
+  return {
+    cancel: (reason) => {
+      if (controller.signal.aborted) return
+      controller.abort(reason)
+      proc?.kill()
+    },
+    done,
   }
-  if (sandbox?.runnerFailed) {
-    notices.push(`[sandbox: the sandbox runner itself failed under ${sandbox.mode} mode — the command did not run; this is a sandbox problem, not a command failure]`)
-  } else if (sandbox?.denied) {
-    notices.push(sandboxDenialMarker(sandbox.mode))
-    notices.push(escalationHintMarker('program'))
-  }
-  if (notices.length === 0) return read.delta
-  const separator = read.delta.length > 0 && !read.delta.endsWith('\n') ? '\n' : ''
-  return `${read.delta}${separator}${notices.join('\n')}`
 }
 
 /** Append the truncation notice, with its spill path, to one collected stream's text. */
@@ -328,27 +386,32 @@ export function apply(ctx) {
           throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
         }
         if (exec.signal.aborted) throw new Error('tool call aborted')
-        return {
-          kind: 'background',
-          jobId: jobs.start({
-            kind: 'python',
-            label: jobLabel(args.code),
-            ...exec.agent !== undefined ? { owner: exec.agent } : {},
-            run: () => {
-              // No exec.signal here: cancellation belongs to the job, not to the
-              // tool call that started it.
-              const proc = ctx.shell.start(ctx.shell.resolve(request))
-              return {
-                cancel: () => void proc.kill(),
-                done: proc.done.then(() => processOutcome(proc)),
-                readOutput: () => renderProcessRead(proc.readOutput(), proc.sandbox),
-              }
-            },
-          }),
-        }
+        // No deadline arms a background run: `onExpiry: 'none'` leaves the
+        // job's own cancellation as the only way to stop it.
+        const spec = ctx.shell.resolve({ ...request, onExpiry: 'none' })
+        let proc
+        const id = jobs.start({
+          kind: 'python',
+          label: jobLabel(args.code),
+          ...exec.agent !== undefined ? { owner: exec.agent.id } : {},
+          // The registry pumps the observed streams into the job's output ring;
+          // `job_output` renders the deltas (with `[stderr]` sections) itself.
+          output: pythonSources(() => proc),
+          run: () => {
+            // No exec.signal here: cancellation belongs to the job, not to the
+            // tool call that started it. The spawn happens inside this starter,
+            // after the registry admitted the job.
+            const hooks = pythonJob(
+              async (signal) => (proc = await ctx.shell.execute({ ...spec, signal })),
+              started => processOutcome(started, escalationModes),
+            )
+            return { done: hooks.done, cancel: (reason) => hooks.cancel(reason) }
+          },
+        })
+        return { kind: 'background', jobId: id }
       }
-      const result = await ctx.shell.run(ctx.shell.resolve({ ...request, signal: exec.signal }))
-      return canonicalResult(result)
+      const execution = await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: exec.signal }))
+      return canonicalResult(await execution.result())
     },
     presentCall(args) {
       return args.run_in_background === true

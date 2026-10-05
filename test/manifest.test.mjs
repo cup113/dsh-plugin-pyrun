@@ -27,12 +27,21 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import semver from 'semver'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 
 /** The harness packages the plugin resolves at runtime and must share with the host. */
 const HOST_PROVIDED = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-sandbox']
+
+/** The runtime contract this plugin declares: every dsh 0.2.x the peer range must admit. */
+const PEER_CONTRACT_RANGE = '^0.2.0-rc.1'
+const RUNTIMES_IN_CONTRACT = ['0.2.0-rc.1', '0.2.0-rc.2', '0.2.0', '0.2.1-alpha.1']
+const RUNTIMES_OUT_OF_CONTRACT = ['0.1.5-rc.2', '0.1.7-rc.2']
+
+/** The exact harness version the local dev copies are pinned to (the contract basis). */
+const DEV_PIN = '0.2.1-alpha.1'
 
 test('host-provided core packages are peer dependencies', () => {
   for (const name of HOST_PROVIDED) {
@@ -66,6 +75,47 @@ test('the local dev copy stays resolvable for the link: install path', () => {
       spec,
       /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/,
       `${name} must be pinned exactly, not a range: the local copy must not drift off the harness version it runs against`,
+    )
+  }
+})
+
+test('peer ranges admit exactly the declared 0.2.x runtime family', () => {
+  // The boot version gate (app-boot plugin-compatibility.ts) evaluates each
+  // @deepseek-ai/dsh-* peer with semver.satisfies(runtime, range, { includePrerelease: true })
+  // and skips the whole bundle on a miss, so the range IS the load contract.
+  for (const name of HOST_PROVIDED) {
+    const range = manifest.peerDependencies?.[name]
+    assert.equal(
+      range,
+      PEER_CONTRACT_RANGE,
+      `${name} must declare exactly ${PEER_CONTRACT_RANGE}: an accidental range edit silently re-trips the version gate`,
+    )
+    for (const runtime of RUNTIMES_IN_CONTRACT) {
+      assert.ok(
+        semver.satisfies(runtime, range, { includePrerelease: true }),
+        `${name} range ${range} must admit dsh ${runtime}`,
+      )
+    }
+    for (const runtime of RUNTIMES_OUT_OF_CONTRACT) {
+      assert.ok(
+        !semver.satisfies(runtime, range, { includePrerelease: true }),
+        `${name} range ${range} must not admit dsh ${runtime}: this plugin no longer carries the 0.1.x contract`,
+      )
+    }
+  }
+})
+
+test('the local dev copies are pinned inside the declared contract', () => {
+  for (const name of HOST_PROVIDED) {
+    const devPin = manifest.devDependencies?.[name]
+    assert.equal(
+      devPin,
+      DEV_PIN,
+      `${name} devDependency must stay pinned to the contract-basis version ${DEV_PIN}`,
+    )
+    assert.ok(
+      semver.satisfies(devPin, manifest.peerDependencies[name], { includePrerelease: true }),
+      `${name} dev pin ${devPin} falls outside the declared peer range ${manifest.peerDependencies[name]}`,
     )
   }
 })

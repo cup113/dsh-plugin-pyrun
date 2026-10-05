@@ -29,7 +29,7 @@ dsh plugin --profile web add link:D:/Projects/dsh-plugin-pyrun
 | 位置 | 作用 |
 |---|---|
 | `peerDependencies` | 运行契约：真正跑这份代码的实例由 harness 提供（非 `link:` 安装时走 `~/.dsh/profiles/node_modules` 回退层，其中 `@deepseek-ai/*` 全部软链到 `...\node_modules\@deepseek-ai\dsh` 的宿主安装树），与宿主 agent loop 共享**同一份物理副本** |
-| `devDependencies`（精确锁定 `0.1.5-rc.2`） | 只为本仓库服务：本插件以 `link:` 安装，Node 按 realpath 从 `D:\Projects\dsh-plugin-pyrun` 解析用它自己的 `import`，而回退层不是它的祖先目录（缺这份副本会直接 `ERR_MODULE_NOT_FOUND` 加载失败）。**消费方 profile 永不安装依赖的 devDependencies**，所以它不会落到 profile 里 |
+| `devDependencies`（精确锁定 `0.2.1-alpha.1`） | 只为本仓库服务：本插件以 `link:` 安装，Node 按 realpath 从 `D:\Projects\dsh-plugin-pyrun` 解析用它自己的 `import`，而回退层不是它的祖先目录（缺这份副本会直接 `ERR_MODULE_NOT_FOUND` 加载失败）。**消费方 profile 永不安装依赖的 devDependencies**，所以它不会落到 profile 里 |
 
 **绝不要把这两个包写进 `dependencies`。** 除 `link:` 之外的安装方式（`file:` / 打包 / registry / git）都会让 profile 安装插件的普通依赖——本机 profile 用 `nodeLinker: hoisted`，会直接把它们物化到 profile 根 `node_modules`——于是进程里出现第二份 `dsh-tools`。它用模块局部 `Symbol('@deepseek-ai/dsh-tools.scheduler')` 当工具调度器的键，两份副本的 Symbol 不相等 → `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined` → **该进程内所有工具调用**都崩在 agent-loop 的 `tool-calls` 上：
 
@@ -62,44 +62,30 @@ Cannot read properties of undefined (reading 'prepare')
 
 后台作业用 `job_output` 收割、`job_kill` 停止，`job_list` 查看名册（kind 显示为 `python`）。
 
-## 版本契约与迁移说明（来自动态插件 `pyrun-1` / `pkg-5`）
+## 版本契约与迁移说明
 
-本包由本会话内的动态 Cordis 插件 `pyrun-1` 迁移而来，其最终版本为 `pkg-5`。迁移过程中最大的教训是**运行版本 ≠ 签出版本**：
+本包由本会话内的动态 Cordis 插件 `pyrun-1` 迁移而来（最终版 `pkg-5` 的等价移植），初版面向 **0.1.5-rc.2** 运行契约，现已完成向 **0.2.x** 的整体移植。
 
 | 树 | 版本 |
 |---|---|
-| 实际运行的安装树 `D:\Programs\nvm\v24.19.0\node_modules\@deepseek-ai\dsh` | **0.1.5-rc.2** ← 行为以此为准 |
-| 签出仓库 `D:\Projects\deepseek-harness` | 0.1.6-alpha.2 |
+| 契约依据：签出仓库 `D:\Projects\deepseek-harness` @ `5badb15009` | **0.2.1-alpha.1**（tag `dsh-v0.2.1-alpha.1`）← 契约以此为准 |
+| npm 已发布的 0.2.x 运行时 | `0.2.0-rc.1`、`0.2.0-rc.2`、`0.2.1-alpha.1`，peer 范围 `^0.2.0-rc.1` 全部覆盖 |
 
-动态版第一版（`pkg-4`）按签出仓库的 API 写，运行即失败：
+`peerDependencies` 是**加载闸门**：`app-boot` 的 `plugin-compatibility.ts` 用 `semver.satisfies(运行时, 范围, { includePrerelease: true })` 逐个检查 `@deepseek-ai/dsh-*` 的 peer，任一不满足即把本包整层跳过（启动日志打出 `skipping profile bundle "dsh-plugin-pyrun"`）。`^0.2.0-rc.1` 覆盖全部 0.2.x 且不再覆盖 0.1.x——**本包在 0.1.x 宿主上会被版本闸门拒绝加载**，0.1.x 用户请继续使用本仓库上一提交（0.1.5-rc.2 契约版本）。`test/manifest.test.mjs` 把这条闸门判定做成了常驻断言。
 
-```
-Error: Cannot read properties of undefined (reading 'Symbol(dsh.scope)')
-```
+### 本包当前依赖的运行契约（0.2.x）
 
-根因是 `jobs` 注册表的 `scopeOf(owner.ctx)`：**0.1.5-rc.2 的 `JobStart.owner` 要求 Agent 活对象**，而按 0.1.6 的契约传了 SessionId 字符串（`exec.agent.id`）。`pkg-5` 改按运行版契约重写后全绿，本包即 `pkg-5` 的等价移植。
+- 前台执行：`const execution = await ctx.shell.execute(spec)`，再 `await execution.result() → ShellRunResult`；**"前台"是等待方式的属性，不是 spawn 的属性**。前台显式带 `signal: exec.signal`，保持默认 `onExpiry: 'kill'`（超时即杀）
+- 后台启动：spawn 发生在 jobs registry 的 starter 内——`run: () => { proc = await ctx.shell.execute({ ...spec, signal }) }`；`spec` 预先以 `onExpiry: 'none'` 解析（后台不设时限，取消归作业的 `cancel(reason)`，不接 `exec.signal`）
+- 句柄 `ShellExecution` = `ShellProcess`（`status` / `exitCode` / `signal` / `done` / `kill()`）+ `result()`；非消费读走 `observed.stdout/stderr.readFrom(byte)`
+- `jobs.start({ kind, label, owner, output, run })`：`owner` 是 **SessionId**（`exec.agent.id`，不再是 Agent 活对象）；`output: [JobOutputSource]` 拉取源由 registry 按自己的节奏泵进输出环，`job_output` 负责渲染（`[stderr]` 分节、丢字通知都在那一层）
+- `JobHooks = { cancel(reason?), done: Promise<JobOutcome> }`——**没有 `readOutput`**；`JobOutcome = { status, detail?, result? }`，sandbox 否决/运行器失败折入终态 `detail`
+- 沙箱三件套不变：`ctx.shell.sandboxMode`（默认模式）、`ctx.get('sandboxPolicy').resolve({ session })`、`ctx.shellEnv.collect(exec)`；"执行器受限但 `ctx.sandboxPolicy` 缺失即抛"的组合守卫保留
+- 参照实现：`packages/shell/tool-pwsh/src/index.ts` 的 `startJob`；其私有 helper（`processSources` / `processJob`）不在任何公开导出里，本包在 `src/index.js` 内自持最小等价物（`pythonSources` / `pythonJob`）
 
-### 本包当前依赖的运行契约（0.1.5-rc.2）
+### 从 0.1.5-rc.2 到 0.2.x 的变更记录（历史）
 
-- `ctx.shell.run(spec): Promise<ShellRunResult>` —— 前台执行直接返回结果
-- `ctx.shell.start(spec): ShellProcess` —— 后台执行，**同步**返回句柄
-- `ShellProcess`：`status` / `exitCode` / `signal` / `done` / `readOutput()` / `kill()`，**没有 `.observed`**
-- `jobs.start({ kind, label, owner, run })`，其中 `owner` 是 **Agent 活对象**
-- `JobHooks = { cancel(reason?), done, readOutput?(): string }` —— 输出是**消费型游标**，通知由生产者自己拼
-- `JobOutcome = { status, detail?, output? }`
-
-### 升级到 0.1.6+ 时的迁移表
-
-| 面 | 0.1.5-rc.2（本包当前） | 0.1.6-alpha.2（升级改法） |
-|---|---|---|
-| 前台执行 | `ctx.shell.run(spec)` → `ShellRunResult` | `ctx.shell.execute(spec)` → `ShellExecution`，再 `await handle.result()` |
-| 后台启动 | `ctx.shell.start(spec)` 同步 → `ShellProcess` | `ctx.shell.execute({ ...spec, signal })` 异步 → `ShellExecution`（spawn 发生在 registry starter 内） |
-| 作业 owner | `owner: exec.agent`（Agent 对象） | `owner: exec.agent.id`（SessionId） |
-| 输出泵 | hooks 的 `readOutput()` 消费游标 | `spec.output: [JobOutputSource]` 拉源，由 registry 按自己节奏泵；`proc.observed.stdout/stderr.readFrom(byte)`（非消费读） |
-| 作业终态 | 自拼 `processOutcome` | 同形；另把 sandbox notes 并入 `detail` |
-| 免超时 | 无 `onExpiry` 字段，`start` 天然忽略 `timeoutMs` | 显式 `onExpiry: 'none'` |
-| 生产者面 | `run()` 无参 | `run(job)` 收到 `JobHandle`（`append` / `updateProgress`） |
-| 输出字段 | `JobOutcome.output` | `JobOutcome.result` |
+初版（0.1.5-rc.2 契约）用的是 `ctx.shell.run()` / `ctx.shell.start()` / Agent 活对象 owner / hooks 的 `readOutput()` 消费游标 / `JobOutcome.output`——那是 `0.1.7-rc.1` 起被删除、0.2.x 未回退的旧世界（官方记录：`.agents/notes/implemented/feature/2026-08-26-shell-execute-projection-and-jobs-at-start.md`、`.agents/notes/implemented/architecture/2026-09-03-jobs-seam-consolidation.md`）。当时最大的教训是**运行版本 ≠ 签出版本**：动态版第一版（`pkg-4`）按签出仓库的 0.1.6 API 写（`owner: exec.agent.id`），而运行的 0.1.5-rc.2 要求 Agent 活对象，加载即报 `Cannot read properties of undefined (reading 'Symbol(dsh.scope)')`；`pkg-5` 按运行版契约重写后全绿。0.2.x 把 `pkg-4` 当年"写错"的方向变成了正式契约。
 
 `kind: 'python'` 两版都合法：注册表把 kind 当作不透明的 id 命名空间（`'pwsh'` 就是既有先例，它并不在 `JobKindMap` 里）。
 
@@ -137,7 +123,7 @@ Error: Cannot read properties of undefined (reading 'Symbol(dsh.scope)')
 
 - **无构建步骤**：纯 ESM JavaScript（`src/index.js`），没有 `prepare` 脚本，因此不会触发 pnpm 的构建拦截（`allowBuilds`）。
 - **核心包必须声明为 `peerDependencies`**：`@deepseek-ai/dsh-tools`（`defineTool`）与 `@deepseek-ai/dsh-sandbox`（`approveEscalation` 与标记文案）被真实 `import`。写进 `dependencies` 会让**消费方 profile** 把它们安装并提升进 profile 根 `node_modules`，造成第二份物理副本、Symbol 分裂、全进程工具调用崩溃（见上「核心包契约」）；同时它们必须精确锁定在 `devDependencies` 里，否则 `link:` 安装的插件解析不到自己的 `import`。`test/manifest.test.mjs` 是这条规则的常驻断言。
-- **lockfile 里的 `dependencies: @deepseek-ai/cordis` 不是本插件的声明**：`package.json` 把 cordis 放在 `peerDependencies`，是 pnpm 的 `autoInstallPeers` 把它自动装进本仓库树的产物，只为本地可加载。消费方 profile 一律按 `package.json` 的 peer 处理。
+- **cordis 的两处分工**：`peerDependencies` 声明 `^4.0.1`（非 `dsh-*` 名，不参与版本闸门；运行实例由宿主提供）；`devDependencies` 精确锁定 `4.0.5-alpha.1`——这是 0.2.1-alpha.1 harness 家族自己钉的 cordis（npm dist-tag `dsh-0-2-1-alpha-1`），本地 dev 副本 `dsh-tools` / `dsh-sandbox` 在模块加载时就要 `import { Service } from '@deepseek-ai/cordis'`，而 `link:` 安装路径实际运行的就是这份本地副本，钉齐可避免本地树出现版本漂移。消费方 profile 永不安装 devDependencies，一律按 `package.json` 的 peer 处理。
 - **测试**：`pnpm test`（`node --test test/`）。在本 DSH 沙箱内 `node --test test/` 会因 piped-stdio spawn 被沙箱拒绝（`spawn EPERM`，沙箱边界而非测试失败），此时改用 `node test/manifest.test.mjs` 或 `node --test --test-isolation=none "test/*.test.mjs"`。
 - **不依赖 `@deepseek-ai/dsh-llm`**：`HarnessError` 只在 `errorInfo()` 的 `instanceof` 判定里被识别，而进程内插件拿到的是另一份独立拷贝，`instanceof` 必为假——与其静默退化，不如根本不走那条路（取消由运行时的规范通道处理）。
 - **改宿主半身 → 重启 `dsh`**；改 `cordis.patch.yml` 可由 `patchReload: live` 生效。
@@ -145,7 +131,7 @@ Error: Cannot read properties of undefined (reading 'Symbol(dsh.scope)')
 
 ## 已知限制
 
-- **没有 promote-on-timeout**：内置 `pwsh`/`bash` 工具在前台超时后会把命令转成后台作业继续跑；本工具前台超时即杀，只保留已产出的部分输出。
+- **没有 promote-on-timeout（刻意决策）**：内置 `pwsh`/`bash` 工具在前台超时后会把命令转成后台作业继续跑；本工具维持"超时即杀"（`onExpiry: 'kill'`，与历史版本模型可见语义一致，输出 union 不引入 `promoted` 分支），只保留已产出的部分输出。需要长跑的程序直接用 `run_in_background`。
 - **没有 Config**：超时、输出上限一律用执行器的默认值与上限。
 - **与同名工具冲突**：本插件在 web profile 里注册 `python`。重启后不要再激活动态插件 `pyrun-1`（它注册同名工具，且进程内已不存在）。
 - **依赖 PATH 中的 `python`**：插件不探测解释器路径。
@@ -169,4 +155,4 @@ Get-ChildItem "$env:USERPROFILE\.dsh" -Recurse -Directory -Filter 'dsh-tools' -E
 
 ⚠️ **崩溃轮次会毒化会话**：那一轮留下了没有对应 `tool/result` 的孤儿 `tool_calls`，此后该会话每轮都报 `INVALID_REQUEST: ... tool calls need immediate results`；插件修好也救不回来，只能弃用并新建会话。
 
-⚠️ **上游同一缺陷未修**：`0.1.5-rc.2` 的 `dsh-tools` 里两处 `TOOL_RUNTIME_SCHEDULER` 都是模块局部 `Symbol(...)`（`lib/index.js:51` 与 `2430`，另有 `lib/types/index.js:51`），没有 `Symbol.for` 兜底。升级 harness 换不掉"插件自带副本"这条路径，本插件只能保证自己不再制造副本。
+⚠️ **上游同一缺陷未修**：截至 `0.2.1-alpha.1`，`dsh-tools` 的 `TOOL_RUNTIME_SCHEDULER` 仍是模块局部 `Symbol(...)`（源码 `packages/core/tools/src/index.ts:480`），没有 `Symbol.for` 兜底。升级 harness 换不掉"插件自带副本"这条路径，本插件只能保证自己不再制造副本。
